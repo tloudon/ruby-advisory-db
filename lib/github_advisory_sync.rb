@@ -1,11 +1,14 @@
+require "active_support"
+require "active_support/core_ext/enumerable"
+require "date"
 require "faraday"
 require "json"
+require 'fileutils'
 require "yaml"
 require "open-uri"
 
 module GitHub
   class GitHubAdvisorySync
-
     # Sync makes sure there are rubysec advisories for all GitHub advisories
     # It writes a set of yaml files, one for each GitHub Advisory that
     # is not already present in this repo
@@ -13,23 +16,13 @@ module GitHub
     # The min_year argument specifies the earliest year CVE to sync.
     # It is more important to sync the newer ones, so this allows the user to
     # control how old of CVEs the sync should pull over
-    def self.sync(min_year: 2015)
-      gh_advisories = GraphQLAPIClient.new.retrieve_all_rubygem_publishable_advisories
+    def self.sync(min_year: 2000, gem_name: nil)
+      gh_advisories = GraphQLAPIClient.new.all_rubygem_advisories(gem_name: gem_name)
 
       # Filter out advisories with a CVE year that is before the min_year
-      gh_advisories.select! do |advisory|
-        if advisory.cve_id
-          _, cve_year = advisory.cve_id.match(/^CVE-(\d+)-\d+$/).to_a
-          cve_year.to_i >= min_year
-        else
-          true # all advisories without a CVE are included too
-        end
-      end
+      gh_advisories.select! { |v| v.cve_after_year?(min_year) }
 
-      files_written = []
-      gh_advisories.each do |advisory|
-        files_written += advisory.write_files
-      end
+      files_written = gh_advisories.filter_map(&:sync).flatten.compact!
 
       puts "\nSync completed"
       if files_written.empty?
@@ -43,14 +36,15 @@ module GitHub
   end
 
   class GraphQLAPIClient
-    GITHUB_API_URL = "https://api.github.com/graphql"
+    GITHUB_API_URL = "https://api.github.com/graphql".freeze
 
     GitHubApiTokenMissingError = Class.new(StandardError)
 
     # return a lazy initialized connection to github api
     def github_api(adapter = :net_http)
-      @faraday_connection ||= begin
+      @github_api ||= begin
         puts "Initializing GitHub API connection to URL: #{GITHUB_API_URL}"
+
         Faraday.new do |conn_builder|
           conn_builder.adapter adapter
           conn_builder.headers = {
@@ -60,7 +54,6 @@ module GitHub
           }
         end
       end
-      @faraday_connection
     end
 
     # An error class which gets raised when a GraphQL request fails
@@ -70,54 +63,72 @@ module GitHub
     # error checking and how queries and requests are formed
     def github_graphql_query(graphql_query_name, graphql_variables = {})
       graphql_query_str = GraphQLQueries.const_get graphql_query_name
-      graphql_body = JSON.generate query: graphql_query_str,
-                                   variables: graphql_variables
+      graphql_body = JSON.generate(query: graphql_query_str, variables: graphql_variables)
+
       puts "Executing GraphQL request: #{graphql_query_name}. Request variables:\n#{graphql_variables.to_yaml}\n"
+
       faraday_response = github_api.post do |req|
         req.url GITHUB_API_URL
         req.body = graphql_body
       end
+
       puts "Got response code: #{faraday_response.status}"
+
       if faraday_response.status != 200
-        raise(GitHubGraphQLAPIError, "GitHub GraphQL request to #{faraday_response.env.url} failed: #{faraday_response.body}")
+        raise(
+          GitHubGraphQLAPIError,
+          "GitHub GraphQL request to #{faraday_response.env.url} failed: #{faraday_response.body}"
+        )
       end
+
       body_obj = JSON.parse faraday_response.body
+
       if body_obj["errors"]
         raise(GitHubGraphQLAPIError, body_obj["errors"].map { |e| e["message"] }.join(", "))
       end
+
       body_obj
     end
 
-    def retrieve_all_github_advisories(max_pages = 1000, page_size = 100)
-      all_advisories = []
-      variables = { "first" => page_size }
-      max_pages.times do |page_num|
-        puts "Getting page #{page_num + 1} of GitHub Advisories"
-        page = github_graphql_query(:GITHUB_ADVISORIES_WITH_RUBYGEM_VULNERABILITY, variables)
-        advisories_this_page = page["data"]["securityAdvisories"]["nodes"]
-        all_advisories += advisories_this_page
-        break unless page["data"]["securityAdvisories"]["pageInfo"]["hasNextPage"] == true
-        variables["after"] = page["data"]["securityAdvisories"]["pageInfo"]["endCursor"]
-      end
-      puts "Retrieved #{all_advisories.length} Advisories from GitHub API"
+    def all_rubygem_advisories(gem_name: nil)
+      advisories = {}
 
-      all_advisories.map do |advisory_graphql_obj|
-        GitHubAdvisory.new github_advisory_graphql_object: advisory_graphql_obj
+      retrieve_all_rubygem_vulnerabilities(gem_name: gem_name).each do |vulnerability|
+        advisory = GitHubAdvisory.new(vulnerability["advisory"])
+
+        next if advisory.withdrawn?
+
+        advisories[advisory.primary_id] ||= advisory
+
+        advisories[advisory.primary_id].vulnerabilities << vulnerability.except("advisory")
       end
+
+      advisories.values
     end
 
-    def retrieve_all_rubygem_publishable_advisories
-      all_advisories = retrieve_all_github_advisories
-      # remove withdrawn advisories,
-      # and remove those where there are no vulnerabilities for ruby
-      all_advisories.reject { |advisory| advisory.withdrawn? }
-                    .select { |advisory| advisory.has_ruby_vulnerabilities? }
+    def retrieve_all_rubygem_vulnerabilities(max_pages = 1000, page_size = 100, gem_name: nil)
+      all_vulnerabilities = []
+      variables = { "first" => page_size, "gem_name" => gem_name }
+      max_pages.times do |page_num|
+        puts "Getting page #{page_num + 1} of GitHub Vulnerabilities"
+
+        page = github_graphql_query(:RUBYGEM_VULNERABILITIES_WITH_GITHUB_ADVISORIES, variables)
+        vulnerabilities_this_page = page["data"]["securityVulnerabilities"]["nodes"]
+        all_vulnerabilities += vulnerabilities_this_page
+
+        break unless page["data"]["securityVulnerabilities"]["pageInfo"]["hasNextPage"] == true
+
+        variables["after"] = page["data"]["securityVulnerabilities"]["pageInfo"]["endCursor"]
+      end
+      puts "Retrieved #{all_vulnerabilities.length} Vulnerabilities from GitHub API"
+
+      all_vulnerabilities
     end
 
     module GraphQLQueries
-      GITHUB_ADVISORIES_WITH_RUBYGEM_VULNERABILITY = <<-GRAPHQL.freeze
-        query($first: Int, $after: String) {
-          securityAdvisories(first: $first, after: $after) {
+      RUBYGEM_VULNERABILITIES_WITH_GITHUB_ADVISORIES = <<-GRAPHQL.freeze
+        query($first: Int, $after: String, $gem_name: String) {
+          securityVulnerabilities(first: $first, after: $after, ecosystem:RUBYGEMS, package: $gem_name) {
             pageInfo {
               endCursor
               hasNextPage
@@ -125,29 +136,37 @@ module GitHub
               startCursor
             }
             nodes {
-              identifiers {
-                type
-                value
+              package {
+                name
+                ecosystem
               }
-              summary
-              description
-              severity
-              references {
-                url
+              vulnerableVersionRange
+              firstPatchedVersion {
+                identifier
               }
-              publishedAt
-              withdrawnAt
-              vulnerabilities(ecosystem:RUBYGEMS, first: 10) {
-                nodes {
-                  package {
-                    name
-                    ecosystem
+              advisory {
+                identifiers {
+                  type
+                  value
+                }
+                summary
+                description
+                severity
+                cvssSeverities {
+                  cvssV3 {
+                    score
+                    vectorString
                   }
-                  vulnerableVersionRange
-                  firstPatchedVersion {
-                    identifier
+                  cvssV4 {
+                    score
+                    vectorString
                   }
                 }
+                references {
+                  url
+                }
+                publishedAt
+                withdrawnAt
               }
             }
           }
@@ -159,22 +178,153 @@ module GitHub
 
     def github_api_token
       unless ENV["GH_API_TOKEN"]
-        raise GitHubApiTokenMissingError, "Unable to make API requests.  Must define 'GH_API_TOKEN' environment variable."
+        raise(
+          GitHubApiTokenMissingError,
+          "Unable to make API requests.  Must define 'GH_API_TOKEN' environment variable."
+        )
       end
+
       ENV["GH_API_TOKEN"]
     end
   end
 
   class GitHubAdvisory
+    class Package
+      NORMALISED_NAMES = {
+        "arabic-prawn"  => "Arabic-Prawn",
+        "redcloth"      => "RedCloth",
+      }
 
-    attr_reader :github_advisory_graphql_object
+      attr_reader :name
 
-    def initialize(github_advisory_graphql_object:)
-      @github_advisory_graphql_object = github_advisory_graphql_object
+      def initialize(advisory, name)
+        @advisory = advisory
+        @name = name
+      end
+
+      def updating?
+        File.exist? filename
+      end
+
+      def filename
+        # These packages appear to have been named differently in the past
+        # This 'corrects' them so updates don't affect existing vulnerabilities
+        package_name = NORMALISED_NAMES.fetch(name, name)
+
+        File.join("gems", package_name, "#{@advisory.primary_id}.yml")
+      end
+
+      def framework
+        case name
+        when "actioncable", "actionmailbox", "actionmailer", "actionpack",
+             "actiontext", "actionview", "activejob", "activemodel",
+             "activerecord", "activestorage", "activesupport", "railties",
+             "jquery-rails"
+          "rails"
+        end
+      end
+
+      def to_h
+        {
+          "gem" => name,
+          "framework" => framework,
+        }.merge(@advisory.to_h)
+      end
+
+      def merge_data(saved_data)
+        data = {}
+
+        # Creating the hash like this makes the key insert order consistent so
+        # the output should always be the same for the same data
+        KEYS.each do |key|
+          data[key] = saved_data[key] || to_h[key]
+        end
+
+        data.compact!
+      end
+
+      KEYS = %w[
+        gem library framework platform cve osvdb ghsa url title date description
+        cvss_v2 cvss_v3 cvss_v4 unaffected_versions patched_versions related notes
+      ].freeze
     end
 
+    attr_reader :advisory, :vulnerabilities
+
+    def initialize(advisory)
+      @advisory = advisory
+      @vulnerabilities = []
+    end
+
+    def self.formatted_yaml(data)
+      yaml = data.to_yaml
+      formatted_yaml = indent_mapping_sequences(yaml)
+
+      return formatted_yaml if yaml_round_trips?(formatted_yaml, data)
+
+      yaml
+    end
+
+    def self.indent_mapping_sequences(yaml)
+      active_sequence_indents = []
+      pending_sequence_indent = nil
+      block_scalar_indent = nil
+
+      yaml.lines.map do |line|
+        if line.strip.empty? || line.start_with?("---")
+          next line
+        end
+
+        indent = line[/\A */].length
+
+        if block_scalar_indent
+          if indent > block_scalar_indent
+            next "#{'  ' * active_sequence_indents.length}#{line}"
+          end
+
+          block_scalar_indent = nil
+        end
+
+        sequence_item = line.match?(/\A\s*-\s/)
+
+        active_sequence_indents.pop while active_sequence_indents.any? &&
+          indent <= active_sequence_indents.last &&
+          !(sequence_item && indent == active_sequence_indents.last)
+
+        if sequence_item && pending_sequence_indent == indent
+          active_sequence_indents << indent
+        end
+
+        pending_sequence_indent = sequence_indent_after_mapping_key(line, indent)
+        block_scalar_indent = indent if block_scalar_header?(line)
+
+        "#{'  ' * active_sequence_indents.length}#{line}"
+      end.join
+    end
+
+    def self.sequence_indent_after_mapping_key(line, indent)
+      if line.match?(/\A\s*-\s+.*:\s*\z/)
+        indent + 2
+      elsif line.match?(/\A\s*[^#].*:\s*\z/)
+        indent
+      end
+    end
+
+    def self.block_scalar_header?(line)
+      line.match?(/\A\s*(?:-\s+)?[^#]+:\s*[>|](?:[+-]?[1-9]|[1-9][+-]?)?\s*\z/)
+    end
+
+    def self.yaml_round_trips?(yaml, data)
+      YAML.safe_load(yaml, permitted_classes: [Date]) == data
+    rescue Psych::Exception
+      false
+    end
+
+    private_class_method :indent_mapping_sequences, :sequence_indent_after_mapping_key,
+                         :block_scalar_header?, :yaml_round_trips?
+
     def identifier_list
-      github_advisory_graphql_object["identifiers"]
+      advisory["identifiers"]
     end
 
     # extract the CVE identifier from the GitHub Advisory identifier list
@@ -195,102 +345,193 @@ module GitHub
     # so a GitHub Security Advisory ID (ghsa_id) is used instead
     def primary_id
       return cve_id if cve_id
+
       ghsa_id
     end
 
     # return a date as a string like 2019-03-21.
     def published_day
-      return nil unless github_advisory_graphql_object["publishedAt"]
+      return unless advisory["publishedAt"]
 
-      pub_date = Date.parse(github_advisory_graphql_object["publishedAt"])
+      pub_date = Date.parse(advisory["publishedAt"])
       # pub_date.strftime("%Y-%m-%d")
       pub_date
     end
 
-    def package_names
-      github_advisory_graphql_object["vulnerabilities"]["nodes"].map{|v| v["package"]["name"]}.uniq
-    end
-
-    def rubysec_filenames
-      package_names.map do |package_name|
-        File.join("gems", package_name, "#{cve_id}.yml")
-      end
-    end
-
     def withdrawn?
-      !github_advisory_graphql_object["withdrawnAt"].nil?
+      !advisory["withdrawnAt"].nil?
+    end
+
+    def cvss_v3
+      cvss_score("cvssV3")
+    end
+
+    def cvss_v4
+      cvss_score("cvssV4")
+    end
+
+    def cvss_score(version)
+      severity = advisory.dig("cvssSeverities", version)
+      return if severity.nil? || severity["vectorString"].nil?
+
+      severity["score"].to_f
     end
 
     def external_reference
-      github_advisory_graphql_object["references"].first["url"]
+      ref_obj = advisory["references"].find do |ref|
+        !ref["url"].start_with?("https://nvd.nist.gov/vuln/detail/")
+      end
+
+      ref_obj["url"]
     end
 
-    def vulnerabilities
-      github_advisory_graphql_object["vulnerabilities"]["nodes"]
-    end
-
-    def has_ruby_vulnerabilities?
-      vulnerabilities.any? do |vuln|
-        vuln["package"]["ecosystem"] == "RUBYGEMS"
+    def packages
+      vulnerabilities.map { |v| v["package"]["name"] }.uniq.map do |name|
+        Package.new(self, name)
       end
     end
 
-    def some_rubysec_files_do_not_exist?
-      rubysec_filenames.any?{|filename| !File.exist?(filename) }
+    def to_h
+      {
+        "cve"         => (cve_id[4..20] if cve_id),
+        "date"        => published_day,
+        "ghsa"        => ghsa_id[5..],
+        "url"         => external_reference,
+        "title"       => advisory["summary"],
+        "description" => advisory["description"],
+        "cvss_v3"     => cvss_v3,
+        "cvss_v4"     => cvss_v4,
+      }.compact
     end
 
-    def write_files
-      return [] unless some_rubysec_files_do_not_exist?
-
-      files_written = []
-      vulnerabilities.each do |vulnerability|
-        filename_to_write = File.join("gems", vulnerability["package"]["name"], "#{primary_id}.yml")
-        next if File.exist?(filename_to_write)
-
-        data = {
-          "gem" => vulnerability["package"]["name"],
-          "ghsa" => ghsa_id[5..],
-          "url" => external_reference,
-          "date" => published_day,
-          "title" => github_advisory_graphql_object["summary"],
-          "description" => github_advisory_graphql_object["description"],
-          "cvss_v3" => "<FILL IN IF AVAILABLE>",
-          "patched_versions" => [ "<FILL IN SEE BELOW>" ],
-          "unaffected_versions" => [ "<OPTIONAL: FILL IN SEE BELOW>" ]
-        }
-        data["cve"] = cve_id[4..20] if cve_id
-
-        dir_to_write = File.dirname(filename_to_write)
-        Dir.mkdir dir_to_write unless Dir.exist?(dir_to_write)
-        File.open(filename_to_write, "w") do |file|
-          # create an automatically generated advisory yaml file
-          file.write data.to_yaml
-
-          # The data we just wrote is incomplete,
-          # and therefore should not be committed as is
-          # We can not directly translate from GitHub to rubysec advisory format
-          #
-          # The patched_versions field is not exactly available.
-          # - GitHub has a first_patched_version field,
-          #   but rubysec advisory needs a ruby version spec
-          #
-          # The unnaffected_versions field is similarly not directly available
-          # This optional field must be inferred from the vulnerableVersionRange
-          #
-          # To help write those fields, we put all the github data below.
-          #
-          # The second block of yaml in a .yaml file is ignored (after the second "---" line)
-          # This effectively makes this data a large comment
-          # Still it should be removed before the data goes into rubysec
-          file.write "\n\n# GitHub advisory data below - **Remove this data before committing**\n"
-          file.write "# Use this data to write patched_versions (and potentially unaffected_versions) above\n"
-          file.write github_advisory_graphql_object.to_yaml
+    def sync
+      packages.map do |package|
+        if package.updating?
+          update(package)
+        else
+          create(package)
         end
-        puts "Wrote: #{filename_to_write}"
-        files_written << filename_to_write
+      end
+    end
+
+    def update(package)
+      saved_data = YAML.safe_load_file(package.filename, permitted_classes: [Date])
+      new_data = package.merge_data(saved_data)
+
+      patched = patched_versions_for(package)
+      if patched.any? && (new_data["patched_versions"].nil? || new_data["patched_versions"].empty?)
+        new_data["patched_versions"] = patched
       end
 
-      files_written
+      return if saved_data == new_data
+
+      File.open(package.filename, 'w') do |file|
+        file.write self.class.formatted_yaml(new_data)
+      end
+
+      puts "Updated: #{package.filename}"
+
+      package.filename
+    end
+
+    def vulnerable_version_ranges_for(package)
+      vulnerabilities.select { |v|
+        v['package']['name'] == package.name
+      }.map { |v|
+        v['vulnerableVersionRange'].split(', ',2).map do |version_range|
+          version_range.split(' ',2)
+        end
+      }.sort_by { |((lower_op,lower_version),(upper_op,upper_version))|
+        lower_version
+      }
+    end
+
+    def unaffected_versions_for(package)
+      if (version_range = vulnerable_version_ranges_for(package).first)
+        lower_version_range = version_range[0]
+        operator, version   = lower_version_range
+
+        case operator
+        when '>'
+          ["<= #{version}"]
+        when '>=', '='
+          ["< #{version}"]
+        end
+      end
+    end
+
+    def first_patched_versions_for(package)
+      first_patched_versions = []
+
+      vulnerabilities.each do |v|
+        if v['package']['name'] == package.name &&
+           v['firstPatchedVersion'] &&
+           v['firstPatchedVersion']['identifier']
+          first_patched_versions << v['firstPatchedVersion']['identifier']
+        end
+      end
+
+      first_patched_versions.sort
+    end
+
+    def patched_versions_for(package)
+      first_patched_versions = first_patched_versions_for(package)
+      patched_versions       = []
+
+      if !first_patched_versions.empty?
+        first_patched_versions[0..-2].each do |version|
+          patched_versions << "~> #{version}"
+        end
+
+        patched_versions << ">= #{first_patched_versions.last}"
+      end
+
+      return patched_versions
+    end
+
+    def create(package)
+      filename_to_write = package.filename
+
+      new_data = package.merge_data(
+        # Include each score only if we have one, else no field.
+        {
+          "cvss_v3" => cvss_v3,
+          "cvss_v4" => cvss_v4,
+        }.compact
+      )
+
+      if (unaffected_versions = unaffected_versions_for(package))
+        new_data['unaffected_versions'] = unaffected_versions
+      end
+
+      patched_versions = patched_versions_for(package)
+
+      if !patched_versions.empty?
+        new_data['patched_versions'] = patched_versions
+      else
+        new_data['notes'] = "Never patched"
+      end
+
+      # populate the related information
+      new_data["related"] = {
+        "url" => advisory["references"].map { |reference| reference['url'] }.reject(&:empty?)
+      }
+
+      FileUtils.mkdir_p(File.dirname(filename_to_write))
+      File.open(filename_to_write, "w") do |file|
+        # create an automatically generated advisory yaml file
+        file.write self.class.formatted_yaml(new_data)
+      end
+      puts "Wrote: #{filename_to_write}"
+      filename_to_write
+    end
+
+    def cve_after_year?(year)
+      # all advisories without a CVE are included too
+      return true unless cve_id
+
+      _, cve_year = cve_id.match(/^CVE-(\d+)-\d+$/).to_a
+      cve_year.to_i >= year
     end
   end
 end

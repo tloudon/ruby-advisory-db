@@ -1,11 +1,14 @@
 source 'https://rubygems.org'
 
-gem 'faraday'
 gem 'rake'
-gem 'kwalify'
-gem 'rspec'
+gem 'faraday',      '~> 2.0'
+gem 'kwalify',      '~> 0.1'
+gem 'json_schemer', '~> 2.0'
+gem 'rspec',        '~> 3.0'
+gem 'base64'
 
 group :development do
   gem 'pry'
-  gem 'nokogiri'
+  gem 'nokogiri',      '~> 1.0'
+  gem 'activesupport', '~> 8.0'
 end

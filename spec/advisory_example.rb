@@ -1,8 +1,10 @@
-load File.join(File.dirname(__FILE__), 'spec_helper.rb')
+require 'spec_helper'
+require 'versions_example'
+
 require 'yaml'
 
 shared_examples_for 'Advisory' do |path|
-  advisory = YAML.load_file(path)
+  advisory = YAML.safe_load_file(path, permitted_classes: [Date])
 
   describe path do
     let(:filename) { File.basename(path) }
@@ -26,20 +28,19 @@ shared_examples_for 'Advisory' do |path|
     end
 
     it "should be correctly named CVE-XXX or OSVDB-XXX or GHSA-XXX" do
-      expect(filename).
-        to match(/^(CVE-\d{4}-(0\d{3}|[1-9]\d{3,})|OSVDB-\d+|GHSA(-[a-z0-9]{4}){3})\.yml$/)
+      expect(filename).to match(
+        /\A
+          (?:
+             CVE-\d{4}-(?:0\d{3}|[1-9]\d{3,})|
+             OSVDB-\d+|
+             GHSA(-[a-z0-9]{4}){3}
+          )\.yml\z
+        /x
+      )
     end
 
     it "should have CVE or OSVDB or GHSA" do
       expect(advisory['cve'] || advisory['osvdb'] || advisory['ghsa']).not_to be_nil
-    end
-
-    describe "framework" do
-      subject { advisory['framework'] }
-
-      it "may be nil or a String" do
-        expect(subject).to be_kind_of(String).or(be_nil)
-      end
     end
 
     describe "platform" do
@@ -56,9 +57,10 @@ shared_examples_for 'Advisory' do |path|
       it "may be nil or a String" do
         expect(subject).to be_kind_of(String).or(be_nil)
       end
+
       it "should be id in filename if filename is CVE-XXX" do
         if filename_cve
-          is_expected.to eq(filename_cve.chomp('.yml'))
+          expect(subject).to eq(filename_cve.chomp('.yml'))
         end
       end
     end
@@ -72,7 +74,7 @@ shared_examples_for 'Advisory' do |path|
 
        it "should be id in filename if filename is OSVDB-XXX" do
         if filename_osvdb
-          is_expected.to eq(filename_osvdb.to_i)
+          expect(subject).to eq(filename_osvdb.to_i)
         end
       end
     end
@@ -85,7 +87,7 @@ shared_examples_for 'Advisory' do |path|
       end
       it "should be id in filename if filename is GHSA-XXX" do
         if filename_ghsa
-          is_expected.to eq(filename_ghsa.chomp('.yml'))
+          expect(subject).to eq(filename_ghsa.chomp('.yml'))
         end
       end
     end
@@ -93,28 +95,65 @@ shared_examples_for 'Advisory' do |path|
     describe "url" do
       subject { advisory['url'] }
 
-      it { is_expected.to be_kind_of(String) }
-      it { is_expected.not_to be_empty }
+      it { expect(subject).to be_kind_of(String) }
+      it { expect(subject).to_not match(%r{\Ahttp(s)?://osvdb\.org}) }
+      it { expect(subject).not_to be_empty }
+
+      it "has a filename that matches the root of the url field" do
+        url = advisory["url"]
+
+        filename_root = File.basename(path, ".yml")
+
+        # 5/24/2026: May 9, 2026 is earliest start date with no failed checks.
+        start_date = Date.new(2026, 5, 9)
+        if advisory["date"] >= start_date and !filename_root.start_with?("OSVDB")
+          expect(url).to include(filename_root)
+        end
+      end
     end
 
     describe "title" do
       subject { advisory['title'] }
 
-      it { is_expected.to be_kind_of(String) }
-      it { is_expected.not_to be_empty }
+      it { expect(subject).to be_kind_of(String) }
+      it { expect(subject).not_to be_empty }
+
+      it "must be one line" do
+        expect(subject).to_not include("\n")
+      end
+
+      it "must not start with or end with additional whitespace" do
+        expect(subject).to_not match(/\A\s|\s\z/)
+      end
     end
 
     describe "date" do
       subject { advisory['date'] }
 
-      it { is_expected.to be_kind_of(Date) }
+      it { expect(subject).to be_kind_of(Date) }
+
+      it "has no dates in the future" do
+        expect(subject).to be <= Date.today
+      end
     end
 
     describe "description" do
       subject { advisory['description'] }
 
-      it { is_expected.to be_kind_of(String) }
-      it { is_expected.not_to be_empty }
+      it "must not be one line" do
+        expect(subject).to include("\n")
+      end
+
+      it "must not have double embbedded newlines" do
+        expect(subject).to_not include("\\n\\n")
+      end
+
+      it "must not have PoC sections" do
+        expect(subject).to_not match(/(#+) *(?:poc\b|proof of concept)/i)
+      end
+
+      it { expect(subject).to be_kind_of(String) }
+      it { expect(subject).not_to be_empty }
     end
 
     describe "cvss_v2" do
@@ -127,7 +166,7 @@ shared_examples_for 'Advisory' do |path|
       case advisory['cvss_v2']
       when Float
         context "when a Float" do
-          it { expect((0.0)..(10.0)).to include(subject) }
+          it { expect(subject).to be_between(0.0, 10.0) }
         end
       end
     end
@@ -142,13 +181,28 @@ shared_examples_for 'Advisory' do |path|
       case advisory['cvss_v3']
       when Float
         context "when a Float" do
-          it { expect((0.0)..(10.0)).to include(subject) }
+          it { expect(subject).to be_between(0.0, 10.0) }
         end
       end
 
       if advisory['cvss_v2']
         it "should also provide a cvss_v2 score" do
           expect(advisory['cvss_v2']).to_not be_nil
+        end
+      end
+    end
+
+    describe "cvss_v4" do
+      subject { advisory['cvss_v4'] }
+
+      it "may be nil or a Float" do
+        expect(subject).to be_kind_of(Float).or(be_nil)
+      end
+
+      case advisory['cvss_v4']
+      when Float
+        context "when a Float" do
+          it { expect(subject).to be_between(0.0, 10.0) }
         end
       end
     end
@@ -160,20 +214,8 @@ shared_examples_for 'Advisory' do |path|
         expect(subject).to be_kind_of(Array).or(be_nil)
       end
 
-      describe "each patched version" do
-        if advisory['patched_versions']
-          advisory['patched_versions'].each do |version|
-            describe version do
-              subject { version.split(', ') }
-
-              it "should contain valid RubyGem version requirements" do
-                expect {
-                Gem::Requirement.new(*subject)
-                }.not_to raise_error
-              end
-            end
-          end
-        end
+      if advisory['patched_versions'].kind_of?(Array)
+        include_examples "Versions", advisory['patched_versions']
       end
     end
 
@@ -184,19 +226,8 @@ shared_examples_for 'Advisory' do |path|
         expect(subject).to be_kind_of(Array).or(be_nil)
       end
 
-      case advisory['unaffected_versions']
-      when Array
-        advisory['unaffected_versions'].each do |version|
-          describe version do
-            subject { version.split(', ') }
-
-            it "should contain valid RubyGem version requirements" do
-              expect {
-                Gem::Requirement.new(*subject)
-              }.not_to raise_error
-            end
-          end
-        end
+      if advisory['unaffected_versions'].kind_of?(Array)
+        include_examples "Versions", advisory['unaffected_versions']
       end
     end
 
@@ -209,8 +240,8 @@ shared_examples_for 'Advisory' do |path|
 
       case advisory["related"]
       when Hash
-        advisory["related"].each_pair do |name, values|
-          describe name do
+        advisory["related"].each_pair do |name,values|
+          describe(name) do
             it "should be either a cve, an osvdb, a ghsa, or a url" do
               expect(["cve", "osvdb", "ghsa", "url"]).to include(name)
             end
@@ -223,6 +254,12 @@ shared_examples_for 'Advisory' do |path|
       end
     end
 
+    describe "notes" do
+      subject { advisory['notes'] }
 
+      it "may be nil or a String" do
+        expect(subject).to be_kind_of(String).or(be_nil)
+      end
+    end
   end
 end

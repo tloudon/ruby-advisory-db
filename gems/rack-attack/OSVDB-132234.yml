@@ -2,7 +2,7 @@
 gem: rack-attack
 osvdb: 132234
 url: https://github.com/kickstarter/rack-attack/releases/tag/v4.3.1
-title: |
+title:
   rack-attack Gem for Ruby missing normalization before request path
   processing
 date: 2015-12-18
@@ -21,6 +21,12 @@ description: |
   `throttle('logins', ...) {|req| req.path == "/login" }`
 
   would not match a request to '/login/', though Rails would route
-  '/login/' to the same '/login' action. 
+  '/login/' to the same '/login' action.
 patched_versions:
   - ">= 4.3.1"
+related:
+  url:
+    - https://github.com/kickstarter/rack-attack/releases/tag/v4.3.1
+    - https://github.com/rack/rack-attack/commit/76c2e3143099d938883ae5654527b47e9e6a8977
+    - https://security.snyk.io/vuln/SNYK-RUBY-RACKATTACK-20246
+    - https://github.com/rack/rack-attack/blob/main/CHANGELOG.md
